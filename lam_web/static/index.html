@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>LiDAR Area Monitor — Web</title>
+<style>
+  :root {
+    --bg: #0f1221;
+    --panel: #171a2b;
+    --accent: #ff8c00;
+    --text: #e9edf1;
+    --muted: #98a2b3;
+    --grid: #1f2340;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: linear-gradient(180deg, #0b0e1a, #10132a); color: var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: #0b0e1a; border-bottom: 1px solid #1d2242; position: sticky; top: 0; z-index: 10; }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .3px; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button {
+    background: #22264a; color: var(--text); border: 1px solid #2d3360; border-radius: 10px; padding: 8px 12px;
+    font-weight: 600; cursor: pointer; transition: transform .06s ease, background .2s ease, border .2s ease;
+  }
+  button:hover { background: #2a2f5a; }
+  button:active { transform: scale(.98); }
+  .danger { border-color: #3a2433; background: #2d1a24; }
+  .danger:hover { background: #361f2b; }
+  .ok { border-color: #1e3a2a; background: #16261d; }
+  .ok:hover { background: #1b2e23; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; margin-left: 6px; }
+  .pill.ok { background: rgba(0,200,83,.15); color: #9af7bf; border: 1px solid rgba(0,200,83,.35); }
+  .pill.warn { background: rgba(255,213,79,.15); color: #ffe08a; border: 1px solid rgba(255,213,79,.35); }
+  #wrap { display: grid; grid-template-columns: 1fr 320px; gap: 12px; padding: 12px; }
+  #panel { background: #171a2b; border: 1px solid #23264a; border-radius: 14px; padding: 8px; }
+  #canvas { width: 100%; height: calc(100vh - 120px); background: #0d1022; border-radius: 12px; display: block; }
+  #side { background: #171a2b; border: 1px solid #23264a; border-radius: 14px; padding: 12px; }
+  #list { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.4; max-height: calc(100vh - 160px); overflow: auto; }
+  @media (max-width: 1100px) { #wrap { grid-template-columns: 1fr; } #side { order: -1; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>LiDAR Area Monitor — Web <span id="wsState" class="pill warn">WS: connecting…</span></h1>
+  <div class="controls">
+    <button id="btnAdd" class="ok">Aggiungi area</button>
+    <button id="btnSet">Imposta come unica area</button>
+    <button id="btnClear" class="danger">Cancella aree</button>
+  </div>
+</header>
+
+<div id="wrap">
+  <div id="panel">
+    <canvas id="canvas"></canvas>
+    <div style="margin-top:6px; font-size:12px; color:#98a2b3">
+      • Tracce: <span style="color:#79e08f">verde</span> = in movimento, <span style="color:#bbb">grigio trasparente</span> = velocità ~0 • Aree: arancione
+    </div>
+  </div>
+  <div id="side">
+    <div style="color:#98a2b3; font-size:12px">Clicca nel canvas per disegnare punti. Doppio click o Invio per chiudere il poligono. ESC per annullare.</div>
+    <hr style="border-color:#23264a"/>
+    <div id="list"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ---------- Canvas & world transform ----------
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const DPR = Math.max(1, window.devicePixelRatio || 1);
+  function resize() {
+    canvas.width = canvas.clientWidth * DPR;
+    canvas.height = canvas.clientHeight * DPR;
+    draw();
+  }
+  window.addEventListener('resize', resize);
+
+  let world = { minx: -1, miny: -1.5, maxx: 2, maxy: 1.5 };
+
+  function fitWorldToAreas(areas) {
+    if (!areas.length) return;
+    let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity;
+    for (const a of areas) {
+      const [ax, ay, bx, by] = a.bounds;
+      minx = Math.min(minx, ax); miny = Math.min(miny, ay);
+      maxx = Math.max(maxx, bx); maxy = Math.max(maxy, by);
+    }
+    const pad = 0.2;
+    world = { minx:minx-pad, miny:miny-pad, maxx:maxx+pad, maxy:maxy+pad };
+  }
+
+  function w2s([x, y]) {
+    const W = canvas.width, H = canvas.height;
+    const sx = (x - world.minx) / (world.maxx - world.minx) * W;
+    const sy = H - (y - world.miny) / (world.maxy - world.miny) * H;
+    return [sx, sy];
+  }
+  function s2w([sx, sy]) {
+    const W = canvas.width, H = canvas.height;
+    const x = world.minx + (sx / W) * (world.maxx - world.minx);
+    const y = world.miny + ((H - sy) / H) * (world.maxy - world.miny);
+    return [x, y];
+  }
+
+  // ---------- State ----------
+  let areas = [];
+  let tracks = [];
+  let drawing = [];
+
+  // ---------- REST ----------
+  async function fetchAreas() {
+    const res = await fetch('/areas');
+    const data = await res.json();
+    areas = data.areas || [];
+    fitWorldToAreas(areas);
+    draw();
+  }
+  async function postArea(coords) {
+    await fetch('/areas', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({coords})});
+    await fetchAreas();
+  }
+  async function putArea(coords) {
+    await fetch('/areas', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({coords})});
+    await fetchAreas();
+  }
+  async function clearAreas() {
+    await fetch('/areas', {method:'DELETE'});
+    areas = []; draw();
+  }
+
+  // ---------- WebSocket ----------
+  const wsState = document.getElementById('wsState');
+  function setWsState(text, cls) {
+    wsState.textContent = text; wsState.className = 'pill ' + (cls||'');
+  }
+  let ws;
+  function openWS() {
+    const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws/tracks`);
+    ws.onopen = () => setWsState('WS: connected', 'ok');
+    ws.onclose = () => { setWsState('WS: disconnected', 'warn'); setTimeout(openWS, 1000); };
+    ws.onerror = () => setWsState('WS: error', 'warn');
+    ws.onmessage = (ev) => {
+      try {
+        const obj = JSON.parse(ev.data);
+        tracks = obj.tracks || [];
+        draw();
+        renderList();
+      } catch {}
+    };
+  }
+
+  // ---------- Interazione disegno ----------
+  canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const p = s2w([(e.clientX - rect.left)*DPR, (e.clientY - rect.top)*DPR]);
+    drawing.push(p);
+    draw();
+  });
+  canvas.addEventListener('dblclick', () => finalizePolygon());
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && drawing.length >= 3) finalizePolygon();
+    if (e.key === 'Escape') { drawing = []; draw(); }
+  });
+
+  document.getElementById('btnAdd').onclick = async () => {
+    if (drawing.length < 3) return alert('Aggiungi almeno 3 punti.');
+    await postArea(drawing); drawing = []; draw();
+  };
+  document.getElementById('btnSet').onclick = async () => {
+    if (drawing.length < 3) return alert('Aggiungi almeno 3 punti.');
+    await putArea(drawing); drawing = []; draw();
+  };
+  document.getElementById('btnClear').onclick = async () => {
+    await clearAreas();
+  };
+
+  function finalizePolygon() {
+    if (drawing.length < 3) return;
+    draw();
+  }
+
+  // ---------- Render ----------
+  function drawGrid() {
+    const W = canvas.width, H = canvas.height;
+    ctx.save();
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = '#0d1022';
+    ctx.fillRect(0,0,W,H);
+    const step = 0.1; // 10 cm
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid');
+    ctx.beginPath();
+    for (let x=Math.ceil(world.minx/step)*step; x<=world.maxx; x+=step) {
+      const [sx1, sy1] = w2s([x, world.miny]);
+      const [sx2, sy2] = w2s([x, world.maxy]);
+      ctx.moveTo(sx1, sy1); ctx.lineTo(sx2, sy2);
+    }
+    for (let y=Math.ceil(world.miny/step)*step; y<=world.maxy; y+=step) {
+      const [sx1, sy1] = w2s([world.minx, y]);
+      const [sx2, sy2] = w2s([world.maxx, y]);
+      ctx.moveTo(sx1, sy1); ctx.lineTo(sx2, sy2);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawAreas() {
+    ctx.save();
+    for (const a of areas) {
+      const [minx,miny,maxx,maxy] = a.bounds;
+      // fill (bbox)
+      ctx.fillStyle = 'rgba(255,140,0,0.18)';
+      const [fx, fy] = w2s([minx, miny]);
+      const [tx, ty] = w2s([maxx, maxy]);
+      const w = Math.abs(tx - fx), h = Math.abs(ty - fy);
+      ctx.fillRect(Math.min(fx,tx), Math.min(fy,ty), w, h);
+
+      // contorno poligono
+      ctx.lineWidth = 2*DPR;
+      ctx.strokeStyle = '#ff8c00';
+      ctx.beginPath();
+      a.coords.forEach((p, i) => {
+        const [sx, sy] = w2s(p);
+        if (i===0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      });
+      if (a.coords.length) {
+        const [sx0, sy0] = w2s(a.coords[0]);
+        ctx.lineTo(sx0, sy0);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawDrawing() {
+    if (!drawing.length) return;
+    ctx.save();
+    ctx.lineWidth = 2*DPR;
+    ctx.strokeStyle = '#70b7ff';
+    ctx.fillStyle = 'rgba(112,183,255,0.12)';
+    ctx.beginPath();
+    drawing.forEach((p, i) => {
+      const [sx, sy] = w2s(p);
+      if (i===0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    });
+    ctx.stroke();
+    for (const p of drawing) {
+      const [sx, sy] = w2s(p);
+      ctx.beginPath(); ctx.arc(sx, sy, 4*DPR, 0, Math.PI*2);
+      ctx.fillStyle = '#a7d4ff'; ctx.fill();
+      ctx.strokeStyle = '#3a6ea5'; ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawTracks() {
+    ctx.save();
+    for (const t of tracks) {
+      const moving = (t.speed || Math.hypot(t.vx||0, t.vy||0)) > 1e-3;
+      const [sx, sy] = w2s([t.x, t.y]);
+      // punto
+      ctx.beginPath();
+      ctx.arc(sx, sy, 6*DPR, 0, Math.PI*2);
+      ctx.fillStyle = moving ? 'rgba(0,200,0,0.9)' : 'rgba(180,180,180,0.35)';
+      ctx.fill();
+
+      // freccia velocità
+      if (moving) {
+        const scale = 0.6;
+        const [sx2, sy2] = w2s([t.x + (t.vx||0)*scale, t.y + (t.vy||0)*scale]);
+        ctx.strokeStyle = '#fff27e';
+        ctx.lineWidth = 2*DPR;
+        ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx2, sy2); ctx.stroke();
+        // punta
+        const ang = Math.atan2(sy2 - sy, sx2 - sx);
+        const ah = 8*DPR, aw = 6*DPR;
+        ctx.beginPath();
+        ctx.moveTo(sx2, sy2);
+        ctx.lineTo(sx2 - ah*Math.cos(ang) + aw*Math.sin(ang), sy2 - ah*Math.sin(ang) - aw*Math.cos(ang));
+        ctx.lineTo(sx2 - ah*Math.cos(ang) - aw*Math.sin(ang), sy2 - ah*Math.sin(ang) + aw*Math.cos(ang));
+        ctx.closePath(); ctx.fillStyle = '#fff27e'; ctx.fill();
+      }
+
+      // bbox
+      if (t.bbox) {
+        const [minx,miny,maxx,maxy] = t.bbox;
+        const [bx, by] = w2s([minx, miny]);
+        const [tx, ty] = w2s([maxx, maxy]);
+        ctx.strokeStyle = 'rgba(100,170,255,0.9)';
+        ctx.lineWidth = 2*DPR;
+        ctx.strokeRect(Math.min(bx,tx), Math.min(by,ty), Math.abs(tx-bx), Math.abs(ty-by));
+      }
+
+      // label
+      ctx.fillStyle = '#e9edf1';
+      ctx.font = `${12*DPR}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+      ctx.fillText(`ID ${t.id}`, sx + 8*DPR, sy - 8*DPR);
+    }
+    ctx.restore();
+  }
+
+  function draw() {
+    if (!canvas.width) resize();
+    drawGrid();
+    drawAreas();
+    drawDrawing();
+    drawTracks();
+  }
+
+  function renderList() {
+    const box = document.getElementById('list');
+    box.innerHTML = '';
+    tracks.forEach(t => {
+      const sp = (t.speed ?? Math.hypot(t.vx||0, t.vy||0)).toFixed(2);
+      const el = document.createElement('div');
+      el.textContent = `ID ${t.id}  x=${t.x.toFixed(2)}  y=${t.y.toFixed(2)}  |v|=${sp} m/s`;
+      box.appendChild(el);
+    });
+  }
+
+  // init
+  resize();
+  fetchAreas();
+  openWS();
+})();
+</script>
+</body>
+</html>
