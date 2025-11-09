@@ -17,6 +17,10 @@ from geometry_msgs.msg import Point as GeoPoint
 from ros2_lam_interfaces.srv import SetExclusionArea
 from std_srvs.srv import Trigger
 
+from led_manager import LedManager
+import atexit
+
+
 
 # ---------------- ROS Bridge ----------------
 class RosBridge(Node):
@@ -42,6 +46,10 @@ class RosBridge(Node):
         # State
         self.latest_areas = {"areas": []}
         self.ws_clients: List[WebSocket] = []
+        
+        self.led_manager = LedManager(self)   # passa il Node esistente
+        atexit.register(self.led_manager.shutdown)
+
 
     # Callbacks
     def _on_areas(self, msg: RosString):
