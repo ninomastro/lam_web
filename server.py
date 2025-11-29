@@ -403,8 +403,18 @@ async def ws_unified(ws: WebSocket):
         pass
     try:
         while True:
-            # mantieni viva la connessione; ignoriamo dati dal client
-            await ws.receive_text()
+            # riceve eventuali comandi dal client (es. arm sorveglianza)
+            msg_txt = await ws.receive_text()
+            try:
+                msg = json.loads(msg_txt)
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get("type") == "arm":
+                val = bool(msg.get("value", True))
+                try:
+                    bridge.led_manager.set_armed(val)
+                except Exception:
+                    pass
     except WebSocketDisconnect:
         pass
     finally:
